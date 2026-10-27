@@ -2,7 +2,7 @@ mod animation;
 mod render;
 
 use std::{
-    io::{self, BufWriter, IsTerminal, stdout},
+    io::{self, IsTerminal, stdout},
     time::{Duration, Instant},
 };
 
@@ -21,7 +21,17 @@ use crossterm::{
 use animation::AnimationState;
 use render::{Renderer, Scene};
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+fn advance_frame_deadline(deadline: Instant, now: Instant) -> Instant {
+    let next = deadline + FRAME_INTERVAL;
+    // 正常帧沿固定节奏推进；耗时超预算时丢弃过期帧，不连续追赶而卡住输入。
+    if next > now {
+        next
+    } else {
+        now + FRAME_INTERVAL
+    }
+}
 
 #[derive(Default)]
 struct TerminalGuard {
@@ -97,6 +107,7 @@ impl AnimationClock {
 enum Input {
     Quit,
     Changed,
+    ToggleRenderMode,
     Ignored,
 }
 
@@ -111,6 +122,7 @@ fn handle_key(key: KeyEvent, clock: &mut AnimationClock, animation: &mut Animati
             clock.paused = !clock.paused;
             Input::Changed
         }
+        KeyCode::Char('b' | 'B') => Input::ToggleRenderMode,
         KeyCode::Char(' ') => {
             animation.next_expression(clock.elapsed.as_secs_f64());
             Input::Changed
@@ -133,7 +145,7 @@ fn main() -> io::Result<()> {
 }
 
 fn run() -> io::Result<()> {
-    let mut out = BufWriter::new(stdout().lock());
+    let mut out = stdout().lock();
     let mut renderer = Renderer::default();
     let mut animation = AnimationState::new();
     let now = Instant::now();
@@ -144,10 +156,11 @@ fn run() -> io::Result<()> {
     let mut size = terminal::size()?;
     let mut dirty = true;
 
-    loop {
+    'animation: loop {
         let now = Instant::now();
         clock.update(now);
-        if now >= next_frame || dirty {
+        let frame_due = now >= next_frame;
+        if frame_due || dirty {
             if now >= next_clock_update {
                 time_text = Local::now().format("%H:%M").to_string();
                 next_clock_update = now + Duration::from_secs(1);
@@ -163,27 +176,39 @@ fn run() -> io::Result<()> {
                     time: &time_text,
                 },
             )?;
-            next_frame = now + FRAME_INTERVAL;
+            if frame_due {
+                next_frame = advance_frame_deadline(next_frame, Instant::now());
+            }
             dirty = false;
         }
 
         // 以帧截止时间等待输入，避免固定 poll 延时叠加绘制耗时。
         if event::poll(next_frame.saturating_duration_since(Instant::now()))? {
-            match event::read()? {
-                Event::Resize(width, height) => {
-                    size = (width, height);
-                    renderer.invalidate();
-                    dirty = true;
-                }
-                Event::Key(key) => {
-                    clock.update(Instant::now());
-                    match handle_key(key, &mut clock, &mut animation) {
-                        Input::Quit => break,
-                        Input::Changed => dirty = true,
-                        Input::Ignored => {}
+            // 合并一批输入/缩放事件后再绘制，并设置上限以免输入洪流饿死动画。
+            for _ in 0..64 {
+                match event::read()? {
+                    Event::Resize(width, height) => {
+                        size = (width, height);
+                        renderer.invalidate();
+                        dirty = true;
                     }
+                    Event::Key(key) => {
+                        clock.update(Instant::now());
+                        match handle_key(key, &mut clock, &mut animation) {
+                            Input::Quit => break 'animation,
+                            Input::Changed => dirty = true,
+                            Input::ToggleRenderMode => {
+                                renderer.toggle_mode();
+                                dirty = true;
+                            }
+                            Input::Ignored => {}
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
     }
@@ -193,6 +218,50 @@ fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_deadlines_target_sixty_fps_without_accumulating_render_time() {
+        let start = Instant::now();
+        let mut deadline = start;
+        for _ in 0..60 {
+            deadline = advance_frame_deadline(deadline, deadline + Duration::from_millis(3));
+        }
+        assert!(Duration::from_secs(1).abs_diff(deadline - start) < Duration::from_micros(1));
+    }
+
+    #[test]
+    fn slow_frames_skip_expired_deadlines_instead_of_catching_up() {
+        let start = Instant::now();
+        let slow_end = start + Duration::from_millis(100);
+        assert_eq!(
+            advance_frame_deadline(start, slow_end),
+            slow_end + FRAME_INTERVAL
+        );
+        let exactly_due = start + FRAME_INTERVAL;
+        assert_eq!(
+            advance_frame_deadline(start, exactly_due),
+            exactly_due + FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn render_mode_key_does_not_change_pause_or_animation_time() {
+        let mut clock = AnimationClock::new(Instant::now());
+        let mut animation = AnimationState::new();
+        for ch in ['b', 'B'] {
+            assert_eq!(
+                handle_key(
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                    &mut clock,
+                    &mut animation
+                ),
+                Input::ToggleRenderMode
+            );
+            assert!(!clock.paused);
+            assert_eq!(clock.elapsed, Duration::ZERO);
+            assert_eq!(animation.expression(), None);
+        }
+    }
 
     #[test]
     fn pause_freezes_animation_time_and_resume_does_not_jump() {

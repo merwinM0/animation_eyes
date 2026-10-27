@@ -15,16 +15,14 @@ pub(crate) enum Expression {
     Surprise,
     LookUp,
     LookDown,
-    Happy,
     Sad,
     Angry,
     Sleepy,
     Curious,
-    Love,
 }
 
 impl Expression {
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Blink,
         Self::Squint,
         Self::WinkLeft,
@@ -32,12 +30,10 @@ impl Expression {
         Self::Surprise,
         Self::LookUp,
         Self::LookDown,
-        Self::Happy,
         Self::Sad,
         Self::Angry,
         Self::Sleepy,
         Self::Curious,
-        Self::Love,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -49,12 +45,10 @@ impl Expression {
             Self::Surprise => "Surprised",
             Self::LookUp => "Look up",
             Self::LookDown => "Look down",
-            Self::Happy => "Happy",
             Self::Sad => "Sad",
             Self::Angry => "Angry",
             Self::Sleepy => "Sleepy",
             Self::Curious => "Curious",
-            Self::Love => "Love",
         }
     }
 
@@ -65,11 +59,10 @@ impl Expression {
             Self::WinkLeft => "-_o",
             Self::WinkRight => "o_-",
             Self::Surprise => "O_O",
-            Self::LookUp | Self::Happy => "^_^",
+            Self::LookUp => "^_^",
             Self::LookDown | Self::Sad => "u_u",
             Self::Angry => ">_<",
             Self::Curious => "o_O",
-            Self::Love => "<3 <3",
         }
     }
 
@@ -80,11 +73,10 @@ impl Expression {
             Self::WinkLeft | Self::WinkRight => 0.4,
             Self::Surprise => 1.2,
             Self::LookUp | Self::LookDown => 0.9,
-            Self::Happy | Self::Sad => 1.6,
+            Self::Sad => 1.6,
             Self::Angry => 1.3,
             Self::Sleepy => 2.2,
             Self::Curious => 1.5,
-            Self::Love => 1.8,
         }
     }
 
@@ -119,14 +111,9 @@ impl Expression {
                     eye.offset_y = direction * pulse * 0.35;
                 }
             }
-            Self::Happy | Self::Sad | Self::Love => {
-                let shape = match self {
-                    Self::Happy => EyeShape::Happy,
-                    Self::Sad => EyeShape::Sad,
-                    _ => EyeShape::Heart,
-                };
+            Self::Sad => {
                 for eye in &mut pose.eyes {
-                    eye.shape = shape;
+                    eye.shape = EyeShape::Sad;
                     eye.blend = pulse;
                 }
             }
@@ -161,9 +148,7 @@ impl Expression {
 pub(crate) enum EyeShape {
     #[default]
     Oval,
-    Happy,
     Sad,
-    Heart,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -302,7 +287,7 @@ impl AnimationState {
         }
 
         // 排除上一动作，既保留自然眨眼的高频率，也避免连续重复。
-        const WEIGHTS: [u32; 13] = [20, 10, 7, 7, 7, 6, 6, 10, 5, 5, 5, 6, 6];
+        const WEIGHTS: [u32; Expression::ALL.len()] = [20, 10, 7, 7, 7, 6, 6, 5, 5, 5, 6];
         let total: u32 = Expression::ALL
             .iter()
             .zip(WEIGHTS)

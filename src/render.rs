@@ -9,6 +9,56 @@ use crossterm::{
 
 use crate::animation::{Expression, EyePose, EyeShape, FacePose};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RenderMode {
+    #[default]
+    Braille,
+    Blocks,
+}
+
+impl RenderMode {
+    fn samples(self) -> &'static [(f64, f64, u8)] {
+        match self {
+            // Unicode 盲文点位不是逐行连续编号，底行分别使用第 7、8 位。
+            Self::Braille => &[
+                (0.25, 0.125, 1),
+                (0.75, 0.125, 8),
+                (0.25, 0.375, 2),
+                (0.75, 0.375, 16),
+                (0.25, 0.625, 4),
+                (0.75, 0.625, 32),
+                (0.25, 0.875, 64),
+                (0.75, 0.875, 128),
+            ],
+            Self::Blocks => &[
+                (0.25, 0.25, 1),
+                (0.75, 0.25, 2),
+                (0.25, 0.75, 4),
+                (0.75, 0.75, 8),
+            ],
+        }
+    }
+
+    fn character(self, mask: u8) -> char {
+        if mask == 0 {
+            return ' ';
+        }
+        match self {
+            // u8 掩码限定在 U+2800..=U+28FF 内，必然是合法 Unicode 标量。
+            Self::Braille => char::from_u32(0x2800 + u32::from(mask))
+                .expect("all eight-dot braille masks are valid Unicode"),
+            Self::Blocks => quadrant_char(mask),
+        }
+    }
+
+    fn hints(self) -> &'static str {
+        match self {
+            Self::Braille => "  Space:next P:pause B:blocks Q:quit",
+            Self::Blocks => "  Space:next P:pause B:dots Q:quit",
+        }
+    }
+}
+
 pub(crate) struct Scene<'a> {
     pub(crate) pose: FacePose,
     pub(crate) expression: Option<Expression>,
@@ -97,14 +147,14 @@ impl Frame {
         }
     }
 
-    fn compose(&mut self, scene: &Scene<'_>) {
+    fn compose(&mut self, scene: &Scene<'_>, mode: RenderMode) {
         let layout = Layout::new(self.width, self.height);
         if self.width == 0 || self.height == 0 {
             return;
         }
         if let Some(eyes) = layout.eyes {
             for (geometry, pose) in eyes.into_iter().zip(scene.pose.eyes) {
-                self.draw_eye(geometry, pose, scene.pose.gaze_x, &layout);
+                self.draw_eye(geometry, pose, scene.pose.gaze_x, &layout, mode);
             }
         } else if layout.content_height > 0 {
             let compact = scene.expression.map_or("o_o", Expression::compact);
@@ -129,18 +179,20 @@ impl Frame {
                     x += 9;
                 }
                 if self.width >= 64 {
-                    self.text(
-                        x,
-                        y,
-                        "  Space:next P:pause Q:quit",
-                        available.saturating_sub(x),
-                    );
+                    self.text(x, y, mode.hints(), available.saturating_sub(x));
                 }
             }
         }
     }
 
-    fn draw_eye(&mut self, geometry: EyeGeometry, pose: EyePose, gaze_x: f64, layout: &Layout) {
+    fn draw_eye(
+        &mut self,
+        geometry: EyeGeometry,
+        pose: EyePose,
+        gaze_x: f64,
+        layout: &Layout,
+        mode: RenderMode,
+    ) {
         let center_x = geometry.center_x + gaze_x * geometry.radius_x * 0.4;
         let center_y = geometry.center_y + pose.offset_y * geometry.radius_y;
         let radius_x = geometry.radius_x * pose.scale_x;
@@ -153,24 +205,27 @@ impl Frame {
         let max_y = (center_y + extent_y)
             .ceil()
             .min(f64::from(layout.content_height)) as u16;
-        const SAMPLES: [(f64, f64, u8); 4] = [
-            (0.25, 0.25, 1),
-            (0.75, 0.25, 2),
-            (0.25, 0.75, 4),
-            (0.75, 0.75, 8),
-        ];
+        let inv_radius_x = radius_x.recip();
+        let inv_radius_y = radius_y.recip();
+        let samples = mode.samples();
+        let mut offsets = [(0.0, 0.0, 0); 8];
+        // 每只眼睛只换算一次采样偏移，像素内循环不再重复做浮点除法。
+        for (offset, &(x, y, bit)) in offsets.iter_mut().zip(samples) {
+            let dx = x * inv_radius_x;
+            *offset = (dx, y * inv_radius_y - pose.tilt * dx, bit);
+        }
         for y in min_y..max_y {
             for x in min_x..max_x {
+                let dx = (f64::from(x) - center_x) * inv_radius_x;
+                let dy = (f64::from(y) - center_y) * inv_radius_y - pose.tilt * dx;
                 let mut mask = 0;
-                for (offset_x, offset_y, bit) in SAMPLES {
-                    let dx = (f64::from(x) + offset_x - center_x) / radius_x;
-                    let dy = (f64::from(y) + offset_y - center_y) / radius_y - pose.tilt * dx;
-                    if eye_contains(dx, dy, pose) {
+                for &(offset_x, offset_y, bit) in &offsets[..samples.len()] {
+                    if eye_contains(dx + offset_x, dy + offset_y, pose) {
                         mask |= bit;
                     }
                 }
                 if mask != 0 {
-                    self.put(x, y, quadrant_char(mask));
+                    self.put(x, y, mode.character(mask));
                 }
             }
         }
@@ -181,19 +236,9 @@ fn eye_contains(x: f64, y: f64, pose: EyePose) -> bool {
     let oval = x * x + y * y - 1.0;
     let target = match pose.shape {
         EyeShape::Oval => oval,
-        EyeShape::Happy | EyeShape::Sad => {
-            let curve = if pose.shape == EyeShape::Happy {
-                -0.35 + 0.8 * x * x
-            } else {
-                0.35 - 0.8 * x * x
-            };
+        EyeShape::Sad => {
+            let curve = 0.35 - 0.8 * x * x;
             ((y - curve).abs() - 0.18).max(oval)
-        }
-        EyeShape::Heart => {
-            // 隐式爱心的顶部超过单位圆，缩入边界内以免两个心瓣被裁平。
-            let hx = x * 1.3;
-            let hy = -y * 1.3;
-            (hx * hx + hy * hy - 1.0).powi(3) - hx * hx * hy.powi(3)
         }
     };
     oval * (1.0 - pose.blend) + target * pose.blend <= 0.0
@@ -211,10 +256,19 @@ pub(crate) struct Renderer {
     previous: Frame,
     current: Frame,
     run: String,
+    output: Vec<u8>,
+    mode: RenderMode,
     invalidated: bool,
 }
 
 impl Renderer {
+    pub(crate) fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            RenderMode::Braille => RenderMode::Blocks,
+            RenderMode::Blocks => RenderMode::Braille,
+        };
+    }
+
     pub(crate) fn invalidate(&mut self) {
         self.invalidated = true;
     }
@@ -227,52 +281,67 @@ impl Renderer {
     ) -> io::Result<()> {
         let (width, height) = size;
         self.current.resize(width, height);
-        self.current.compose(scene);
+        self.current.compose(scene, self.mode);
         let resized = self.previous.width != width || self.previous.height != height;
         if width == 0 || height == 0 {
             self.previous.resize(width, height);
             self.invalidate();
             return Ok(());
         }
-        let mut changed = resized || self.invalidated;
-        if changed {
+        self.output.clear();
+        let full_redraw = resized || self.invalidated;
+        let mut changed = full_redraw;
+        if full_redraw {
             queue!(
-                out,
+                self.output,
                 ResetColor,
                 Clear(ClearType::All),
                 SetForegroundColor(Color::White)
             )?;
-            self.previous.resize(width, height);
         }
-        // 按行合并相邻变化，空格也参与差量绘制，负责擦除上一帧的残影。
+        // 空格也参与差量绘制；合并至多两个未变字符的短间隔，减少光标控制序列。
         for y in 0..height {
             let row = usize::from(y) * usize::from(width);
+            let differs = |x: u16| {
+                let index = row + usize::from(x);
+                let old = if full_redraw {
+                    ' '
+                } else {
+                    self.previous.cells[index]
+                };
+                self.current.cells[index] != old
+            };
             let mut x = 0;
             while x < width {
-                let index = row + usize::from(x);
-                if self.current.cells[index] == self.previous.cells[index] {
+                if !differs(x) {
                     x += 1;
                     continue;
                 }
                 if !changed {
                     changed = true;
-                    queue!(out, SetForegroundColor(Color::White))?;
+                    queue!(self.output, SetForegroundColor(Color::White))?;
                 }
                 let start_x = x;
-                self.run.clear();
-                while x < width {
-                    let index = row + usize::from(x);
-                    if self.current.cells[index] == self.previous.cells[index] {
-                        break;
+                let mut end_x = x + 1;
+                let mut scan_x = end_x;
+                while scan_x < width && scan_x - end_x <= 2 {
+                    if differs(scan_x) {
+                        end_x = scan_x + 1;
                     }
-                    self.run.push(self.current.cells[index]);
-                    x += 1;
+                    scan_x += 1;
                 }
-                queue!(out, MoveTo(start_x, y), Print(self.run.as_str()))?;
+                self.run.clear();
+                self.run.extend(
+                    &self.current.cells[row + usize::from(start_x)..row + usize::from(end_x)],
+                );
+                queue!(self.output, MoveTo(start_x, y), Print(self.run.as_str()))?;
+                x = end_x;
             }
         }
         if changed {
-            queue!(out, ResetColor)?;
+            queue!(self.output, ResetColor)?;
+            // 整帧先编码进可复用缓冲，再一次性提交，避免逐条指令触发终端 IO。
+            out.write_all(&self.output)?;
             out.flush()?;
         }
         std::mem::swap(&mut self.previous, &mut self.current);
@@ -296,10 +365,34 @@ mod tests {
     }
 
     fn frame(size: (u16, u16), scene: &Scene<'_>) -> Frame {
+        frame_with_mode(size, scene, RenderMode::default())
+    }
+
+    fn frame_with_mode(size: (u16, u16), scene: &Scene<'_>, mode: RenderMode) -> Frame {
         let mut frame = Frame::default();
         frame.resize(size.0, size.1);
-        frame.compose(scene);
+        frame.compose(scene, mode);
         frame
+    }
+
+    #[derive(Default)]
+    struct OutputStats {
+        writes: usize,
+        flushes: usize,
+        bytes: usize,
+    }
+
+    impl Write for OutputStats {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
     }
 
     #[test]
@@ -390,28 +483,140 @@ mod tests {
     }
 
     #[test]
-    fn heart_has_two_lobes_and_a_lower_point() {
-        let heart = EyePose {
-            shape: EyeShape::Heart,
+    fn sad_curve_is_symmetric_and_blends_back_to_an_oval() {
+        let sad = EyePose {
+            shape: EyeShape::Sad,
             blend: 1.0,
             ..EyePose::default()
         };
-        assert!(!eye_contains(0.0, -0.9, heart));
-        assert!(eye_contains(0.4, -0.7, heart));
-        assert!(eye_contains(-0.4, -0.7, heart));
-        assert!(eye_contains(0.0, 0.75, heart));
-        assert!(!eye_contains(0.6, 0.75, heart));
-        for step in -100..=100 {
-            let coordinate = f64::from(step) / 100.0;
-            for (x, y) in [
-                (coordinate, -1.0),
-                (coordinate, 1.0),
-                (-1.0, coordinate),
-                (1.0, coordinate),
-            ] {
-                assert!(!eye_contains(x, y, heart), "heart exceeds its bounding box");
-            }
+        assert!(eye_contains(0.0, 0.35, sad));
+        assert!(!eye_contains(0.0, -0.35, sad));
+        assert!(eye_contains(0.8, -0.16, sad));
+        assert!(eye_contains(-0.8, -0.16, sad));
+        let neutral = EyePose { blend: 0.0, ..sad };
+        assert!(eye_contains(0.0, -0.35, neutral));
+        assert!(!eye_contains(1.1, 0.0, neutral));
+    }
+
+    #[test]
+    fn braille_uses_the_standard_eight_dot_positions() {
+        let samples = RenderMode::Braille.samples();
+        assert_eq!(samples.len(), 8);
+        for (index, &(x, y, bit)) in samples.iter().enumerate() {
+            assert_eq!(x, if index % 2 == 0 { 0.25 } else { 0.75 });
+            assert_eq!(y, 0.125 + (index / 2) as f64 * 0.25);
+            assert_eq!(bit, [1, 8, 2, 16, 4, 32, 64, 128][index]);
         }
+        for mask in 1..=u8::MAX {
+            assert_eq!(
+                RenderMode::Braille.character(mask) as u32,
+                0x2800 + u32::from(mask)
+            );
+        }
+        assert_eq!(RenderMode::Braille.character(0), ' ');
+        assert_eq!(RenderMode::Braille.character(255), '⣿');
+        assert_eq!(RenderMode::Blocks.character(15), '█');
+    }
+
+    #[test]
+    fn braille_resolves_vertical_motion_between_block_samples() {
+        let sample_cell = |mode, center_y| {
+            let mut frame = Frame::default();
+            frame.resize(12, 6);
+            let layout = Layout::new(12, 6);
+            frame.draw_eye(
+                EyeGeometry {
+                    center_x: 4.5,
+                    center_y,
+                    radius_x: 1.0,
+                    radius_y: 1.0,
+                },
+                EyePose {
+                    scale_y: 0.1,
+                    ..EyePose::default()
+                },
+                0.0,
+                &layout,
+                mode,
+            );
+            frame.cells[2 * 12 + 4]
+        };
+        assert_eq!(
+            sample_cell(RenderMode::Blocks, 2.0),
+            sample_cell(RenderMode::Blocks, 2.125)
+        );
+        assert_ne!(
+            sample_cell(RenderMode::Braille, 2.0),
+            sample_cell(RenderMode::Braille, 2.125)
+        );
+    }
+
+    #[test]
+    fn mode_switch_replaces_old_glyphs_without_clearing_the_screen() {
+        let mut renderer = Renderer::default();
+        let mut output = Vec::new();
+        for mode in [RenderMode::Braille, RenderMode::Blocks, RenderMode::Braille] {
+            output.clear();
+            renderer.draw(&mut output, (80, 24), &scene()).unwrap();
+            assert_eq!(renderer.mode, mode);
+            assert_eq!(
+                renderer.previous.cells,
+                frame_with_mode((80, 24), &scene(), mode).cells
+            );
+            if mode == RenderMode::Blocks {
+                assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+                assert!(
+                    !renderer
+                        .previous
+                        .cells
+                        .iter()
+                        .any(|ch| ('\u{2800}'..='\u{28ff}').contains(ch))
+                );
+            }
+            renderer.toggle_mode();
+        }
+    }
+
+    #[test]
+    fn changed_frames_are_submitted_with_one_write_and_one_flush() {
+        let mut renderer = Renderer::default();
+        let mut stats = OutputStats::default();
+        renderer.draw(&mut stats, (160, 48), &scene()).unwrap();
+        assert_eq!((stats.writes, stats.flushes), (1, 1));
+        renderer.draw(&mut stats, (160, 48), &scene()).unwrap();
+        assert_eq!((stats.writes, stats.flushes), (1, 1));
+        renderer
+            .draw(
+                &mut stats,
+                (160, 48),
+                &Scene {
+                    time: "12:35",
+                    ..scene()
+                },
+            )
+            .unwrap();
+        assert_eq!((stats.writes, stats.flushes), (2, 2));
+    }
+
+    #[test]
+    fn nearby_changes_share_one_cursor_move() {
+        let mut renderer = Renderer::default();
+        let mut output = Vec::new();
+        renderer.draw(&mut output, (80, 24), &scene()).unwrap();
+        output.clear();
+        renderer
+            .draw(
+                &mut output,
+                (80, 24),
+                &Scene {
+                    time: "13:35",
+                    ..scene()
+                },
+            )
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("\x1b[24;77H3:35"));
+        assert_eq!(output.matches('H').count(), 1);
     }
 
     #[test]
@@ -483,6 +688,76 @@ mod tests {
         assert!(output.contains(' '));
         assert!(!output.contains("\x1b[2J"));
         assert_eq!(renderer.previous.cells, frame((80, 24), &moved).cells);
+    }
+
+    #[test]
+    fn flush_errors_do_not_commit_an_unfinished_frame() {
+        struct FailedFlush;
+        impl Write for FailedFlush {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
+            }
+        }
+        let mut renderer = Renderer::default();
+        assert_eq!(
+            renderer
+                .draw(&mut FailedFlush, (80, 24), &scene())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(renderer.previous.cells.is_empty());
+        renderer.draw(&mut io::sink(), (80, 24), &scene()).unwrap();
+        assert_eq!(renderer.previous.cells, frame((80, 24), &scene()).cells);
+    }
+
+    #[test]
+    #[ignore = "手动测量渲染耗时与输出量，不在正常测试中断言机器性能"]
+    fn measure_render_throughput() {
+        use std::time::{Duration, Instant};
+
+        for mode in [RenderMode::Blocks, RenderMode::Braille] {
+            for size in [(80, 24), (160, 48), (320, 100)] {
+                let mut renderer = Renderer {
+                    mode,
+                    ..Renderer::default()
+                };
+                let mut stats = OutputStats::default();
+                let mut animation = AnimationState::new();
+                let mut timings = Vec::with_capacity(660);
+                for index in 0..660 {
+                    let t = f64::from(index) / 60.0;
+                    if index % 60 == 0 {
+                        animation.next_expression(t);
+                    }
+                    let mut pose = animation.sample(t);
+                    pose.gaze_x = (t * 3.0).sin();
+                    let scene = Scene {
+                        pose,
+                        expression: animation.expression(),
+                        ..scene()
+                    };
+                    let start = Instant::now();
+                    renderer.draw(&mut stats, size, &scene).unwrap();
+                    timings.push(start.elapsed());
+                    std::hint::black_box(&renderer.previous.cells);
+                }
+                let total: Duration = timings.iter().sum();
+                timings.sort_unstable();
+                println!(
+                    "{mode:?} {}x{}: avg={:.1}us p95={:.1}us max={:.1}us bytes/frame={:.1}",
+                    size.0,
+                    size.1,
+                    total.as_secs_f64() * 1e6 / timings.len() as f64,
+                    timings[timings.len() * 95 / 100].as_secs_f64() * 1e6,
+                    timings.last().unwrap().as_secs_f64() * 1e6,
+                    stats.bytes as f64 / timings.len() as f64
+                );
+            }
+        }
     }
 
     #[test]
