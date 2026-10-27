@@ -6,5 +6,15 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.29.0"
-viuer = "0.11.0"
-image = { version = "0.25", default-features = false, features = ["png"] }
+
+# 保留堆栈行号，避免日常构建生成大量调试信息。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+
+# 需要调试器检查变量时使用 cargo build --profile debugging。
+[profile.debugging]
+inherits = "dev"
+debug = 2
