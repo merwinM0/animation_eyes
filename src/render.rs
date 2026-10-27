@@ -12,7 +12,6 @@ use crate::animation::{Expression, EyePose, FacePose};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RenderMode {
     #[default]
-    DenseDots,
     Braille,
     Blocks,
 }
@@ -21,7 +20,7 @@ impl RenderMode {
     fn samples(self) -> &'static [(f64, f64, u8)] {
         match self {
             // Unicode 盲文点位不是逐行连续编号，底行分别使用第 7、8 位。
-            Self::DenseDots | Self::Braille => &[
+            Self::Braille => &[
                 (0.25, 0.125, 1),
                 (0.75, 0.125, 8),
                 (0.25, 0.375, 2),
@@ -45,11 +44,8 @@ impl RenderMode {
             return ' ';
         }
         match self {
-            // 仅替换八个采样点全部命中的字符格；轮廓仍保留 2×4 点阵精度。
-            // 盲文字形的点距由字体决定，内部用高覆盖率密纹补足视觉密度。
-            Self::DenseDots if mask == u8::MAX => '▓',
             // u8 掩码限定在 U+2800..=U+28FF 内，必然是合法 Unicode 标量。
-            Self::DenseDots | Self::Braille => char::from_u32(0x2800 + u32::from(mask))
+            Self::Braille => char::from_u32(0x2800 + u32::from(mask))
                 .expect("all eight-dot braille masks are valid Unicode"),
             Self::Blocks => quadrant_char(mask),
         }
@@ -57,9 +53,8 @@ impl RenderMode {
 
     fn hints(self) -> &'static str {
         match self {
-            Self::DenseDots => "  Space:next P:pause B:sparse Q:quit",
             Self::Braille => "  Space:next P:pause B:blocks Q:quit",
-            Self::Blocks => "  Space:next P:pause B:dense Q:quit",
+            Self::Blocks => "  Space:next P:pause B:dots Q:quit",
         }
     }
 }
@@ -261,9 +256,8 @@ pub(crate) struct Renderer {
 impl Renderer {
     pub(crate) fn toggle_mode(&mut self) {
         self.mode = match self.mode {
-            RenderMode::DenseDots => RenderMode::Braille,
             RenderMode::Braille => RenderMode::Blocks,
-            RenderMode::Blocks => RenderMode::DenseDots,
+            RenderMode::Blocks => RenderMode::Braille,
         };
     }
 
@@ -492,32 +486,22 @@ mod tests {
     }
 
     #[test]
-    fn dense_dots_fill_only_the_interior_and_preserve_every_edge_mask() {
-        assert_eq!(RenderMode::DenseDots.character(0), ' ');
-        assert_eq!(RenderMode::DenseDots.character(255), '▓');
-        for mask in 1..255 {
-            assert_eq!(
-                RenderMode::DenseDots.character(mask),
-                RenderMode::Braille.character(mask)
+    fn default_mode_uses_only_braille_dots_for_every_expression() {
+        assert_eq!(RenderMode::default(), RenderMode::Braille);
+        let mut animation = AnimationState::new();
+        for _ in Expression::ALL {
+            animation.next_expression(0.0);
+            let scene = Scene {
+                pose: animation.sample(0.0),
+                ..scene()
+            };
+            let frame = frame((80, 24), &scene);
+            let body = &frame.cells[..80 * 23];
+            assert!(body.contains(&'⣿'));
+            assert!(
+                body.iter()
+                    .all(|ch| *ch == ' ' || ('\u{2801}'..='\u{28ff}').contains(ch))
             );
-        }
-        let dense = frame_with_mode((80, 24), &scene(), RenderMode::DenseDots);
-        let sparse = frame_with_mode((80, 24), &scene(), RenderMode::Braille);
-        let body_end = 80 * 23;
-        assert!(dense.cells[..body_end].contains(&'▓'));
-        assert!(
-            dense.cells[..body_end]
-                .iter()
-                .any(|ch| ('\u{2801}'..='\u{28fe}').contains(ch))
-        );
-        for (&dense_cell, &sparse_cell) in dense.cells[..body_end]
-            .iter()
-            .zip(&sparse.cells[..body_end])
-        {
-            assert_eq!(dense_cell == ' ', sparse_cell == ' ');
-            if dense_cell != sparse_cell {
-                assert_eq!((dense_cell, sparse_cell), ('▓', '⣿'));
-            }
         }
     }
 
@@ -578,14 +562,9 @@ mod tests {
     fn mode_switch_replaces_old_glyphs_without_clearing_the_screen() {
         let mut renderer = Renderer::default();
         let mut output = Vec::new();
-        for (index, mode) in [
-            RenderMode::DenseDots,
-            RenderMode::Braille,
-            RenderMode::Blocks,
-            RenderMode::DenseDots,
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, mode) in [RenderMode::Braille, RenderMode::Blocks, RenderMode::Braille]
+            .into_iter()
+            .enumerate()
         {
             output.clear();
             renderer.draw(&mut output, (80, 24), &scene()).unwrap();
@@ -596,9 +575,6 @@ mod tests {
             );
             if index > 0 {
                 assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
-            }
-            if mode != RenderMode::DenseDots {
-                assert!(!renderer.previous.cells.contains(&'▓'));
             }
             if mode == RenderMode::Blocks {
                 assert!(
@@ -755,11 +731,7 @@ mod tests {
     fn measure_render_throughput() {
         use std::time::{Duration, Instant};
 
-        for mode in [
-            RenderMode::Blocks,
-            RenderMode::Braille,
-            RenderMode::DenseDots,
-        ] {
+        for mode in [RenderMode::Blocks, RenderMode::Braille] {
             for size in [(80, 24), (160, 48), (320, 100)] {
                 let mut renderer = Renderer {
                     mode,
