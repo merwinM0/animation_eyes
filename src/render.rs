@@ -7,11 +7,12 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 
-use crate::animation::{Expression, EyePose, EyeShape, FacePose};
+use crate::animation::{Expression, EyePose, FacePose};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RenderMode {
     #[default]
+    DenseDots,
     Braille,
     Blocks,
 }
@@ -20,7 +21,7 @@ impl RenderMode {
     fn samples(self) -> &'static [(f64, f64, u8)] {
         match self {
             // Unicode 盲文点位不是逐行连续编号，底行分别使用第 7、8 位。
-            Self::Braille => &[
+            Self::DenseDots | Self::Braille => &[
                 (0.25, 0.125, 1),
                 (0.75, 0.125, 8),
                 (0.25, 0.375, 2),
@@ -44,8 +45,11 @@ impl RenderMode {
             return ' ';
         }
         match self {
+            // 仅替换八个采样点全部命中的字符格；轮廓仍保留 2×4 点阵精度。
+            // 盲文字形的点距由字体决定，内部用高覆盖率密纹补足视觉密度。
+            Self::DenseDots if mask == u8::MAX => '▓',
             // u8 掩码限定在 U+2800..=U+28FF 内，必然是合法 Unicode 标量。
-            Self::Braille => char::from_u32(0x2800 + u32::from(mask))
+            Self::DenseDots | Self::Braille => char::from_u32(0x2800 + u32::from(mask))
                 .expect("all eight-dot braille masks are valid Unicode"),
             Self::Blocks => quadrant_char(mask),
         }
@@ -53,8 +57,9 @@ impl RenderMode {
 
     fn hints(self) -> &'static str {
         match self {
+            Self::DenseDots => "  Space:next P:pause B:sparse Q:quit",
             Self::Braille => "  Space:next P:pause B:blocks Q:quit",
-            Self::Blocks => "  Space:next P:pause B:dots Q:quit",
+            Self::Blocks => "  Space:next P:pause B:dense Q:quit",
         }
     }
 }
@@ -196,7 +201,7 @@ impl Frame {
         let center_x = geometry.center_x + gaze_x * geometry.radius_x * 0.4;
         let center_y = geometry.center_y + pose.offset_y * geometry.radius_y;
         let radius_x = geometry.radius_x * pose.scale_x;
-        // 闭眼保留亚字符厚度，不再被整数半径的最小值卡成睁眼状态。
+        // 使用浮点半径保留亚字符精度，极小窗口下也保证采样厚度。
         let radius_y = (geometry.radius_y * pose.scale_y).max(0.3);
         let extent_y = radius_y * (1.0 + pose.tilt.abs());
         let min_x = (center_x - radius_x).floor().max(0.0) as u16;
@@ -220,7 +225,7 @@ impl Frame {
                 let dy = (f64::from(y) - center_y) * inv_radius_y - pose.tilt * dx;
                 let mut mask = 0;
                 for &(offset_x, offset_y, bit) in &offsets[..samples.len()] {
-                    if eye_contains(dx + offset_x, dy + offset_y, pose) {
+                    if eye_contains(dx + offset_x, dy + offset_y) {
                         mask |= bit;
                     }
                 }
@@ -232,16 +237,8 @@ impl Frame {
     }
 }
 
-fn eye_contains(x: f64, y: f64, pose: EyePose) -> bool {
-    let oval = x * x + y * y - 1.0;
-    let target = match pose.shape {
-        EyeShape::Oval => oval,
-        EyeShape::Sad => {
-            let curve = 0.35 - 0.8 * x * x;
-            ((y - curve).abs() - 0.18).max(oval)
-        }
-    };
-    oval * (1.0 - pose.blend) + target * pose.blend <= 0.0
+fn eye_contains(x: f64, y: f64) -> bool {
+    x * x + y * y <= 1.0
 }
 
 fn quadrant_char(mask: u8) -> char {
@@ -264,8 +261,9 @@ pub(crate) struct Renderer {
 impl Renderer {
     pub(crate) fn toggle_mode(&mut self) {
         self.mode = match self.mode {
+            RenderMode::DenseDots => RenderMode::Braille,
             RenderMode::Braille => RenderMode::Blocks,
-            RenderMode::Blocks => RenderMode::Braille,
+            RenderMode::Blocks => RenderMode::DenseDots,
         };
     }
 
@@ -483,19 +481,44 @@ mod tests {
     }
 
     #[test]
-    fn sad_curve_is_symmetric_and_blends_back_to_an_oval() {
-        let sad = EyePose {
-            shape: EyeShape::Sad,
-            blend: 1.0,
-            ..EyePose::default()
-        };
-        assert!(eye_contains(0.0, 0.35, sad));
-        assert!(!eye_contains(0.0, -0.35, sad));
-        assert!(eye_contains(0.8, -0.16, sad));
-        assert!(eye_contains(-0.8, -0.16, sad));
-        let neutral = EyePose { blend: 0.0, ..sad };
-        assert!(eye_contains(0.0, -0.35, neutral));
-        assert!(!eye_contains(1.1, 0.0, neutral));
+    fn open_eyes_are_filled_ellipses_instead_of_closed_curves() {
+        assert!(eye_contains(0.0, 0.0));
+        assert!(eye_contains(0.0, -0.8));
+        assert!(eye_contains(0.0, 0.8));
+        assert!(eye_contains(0.8, 0.0));
+        assert!(eye_contains(-0.8, 0.0));
+        assert!(!eye_contains(0.8, 0.8));
+        assert!(!eye_contains(1.1, 0.0));
+    }
+
+    #[test]
+    fn dense_dots_fill_only_the_interior_and_preserve_every_edge_mask() {
+        assert_eq!(RenderMode::DenseDots.character(0), ' ');
+        assert_eq!(RenderMode::DenseDots.character(255), '▓');
+        for mask in 1..255 {
+            assert_eq!(
+                RenderMode::DenseDots.character(mask),
+                RenderMode::Braille.character(mask)
+            );
+        }
+        let dense = frame_with_mode((80, 24), &scene(), RenderMode::DenseDots);
+        let sparse = frame_with_mode((80, 24), &scene(), RenderMode::Braille);
+        let body_end = 80 * 23;
+        assert!(dense.cells[..body_end].contains(&'▓'));
+        assert!(
+            dense.cells[..body_end]
+                .iter()
+                .any(|ch| ('\u{2801}'..='\u{28fe}').contains(ch))
+        );
+        for (&dense_cell, &sparse_cell) in dense.cells[..body_end]
+            .iter()
+            .zip(&sparse.cells[..body_end])
+        {
+            assert_eq!(dense_cell == ' ', sparse_cell == ' ');
+            if dense_cell != sparse_cell {
+                assert_eq!((dense_cell, sparse_cell), ('▓', '⣿'));
+            }
+        }
     }
 
     #[test]
@@ -555,7 +578,15 @@ mod tests {
     fn mode_switch_replaces_old_glyphs_without_clearing_the_screen() {
         let mut renderer = Renderer::default();
         let mut output = Vec::new();
-        for mode in [RenderMode::Braille, RenderMode::Blocks, RenderMode::Braille] {
+        for (index, mode) in [
+            RenderMode::DenseDots,
+            RenderMode::Braille,
+            RenderMode::Blocks,
+            RenderMode::DenseDots,
+        ]
+        .into_iter()
+        .enumerate()
+        {
             output.clear();
             renderer.draw(&mut output, (80, 24), &scene()).unwrap();
             assert_eq!(renderer.mode, mode);
@@ -563,8 +594,13 @@ mod tests {
                 renderer.previous.cells,
                 frame_with_mode((80, 24), &scene(), mode).cells
             );
-            if mode == RenderMode::Blocks {
+            if index > 0 {
                 assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+            }
+            if mode != RenderMode::DenseDots {
+                assert!(!renderer.previous.cells.contains(&'▓'));
+            }
+            if mode == RenderMode::Blocks {
                 assert!(
                     !renderer
                         .previous
@@ -719,7 +755,11 @@ mod tests {
     fn measure_render_throughput() {
         use std::time::{Duration, Instant};
 
-        for mode in [RenderMode::Blocks, RenderMode::Braille] {
+        for mode in [
+            RenderMode::Blocks,
+            RenderMode::Braille,
+            RenderMode::DenseDots,
+        ] {
             for size in [(80, 24), (160, 48), (320, 100)] {
                 let mut renderer = Renderer {
                     mode,
@@ -727,9 +767,10 @@ mod tests {
                 };
                 let mut stats = OutputStats::default();
                 let mut animation = AnimationState::new();
-                let mut timings = Vec::with_capacity(660);
-                for index in 0..660 {
-                    let t = f64::from(index) / 60.0;
+                let frame_count = Expression::ALL.len() * 120;
+                let mut timings = Vec::with_capacity(frame_count);
+                for index in 0..frame_count {
+                    let t = index as f64 / 60.0;
                     if index % 60 == 0 {
                         animation.next_expression(t);
                     }

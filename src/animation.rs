@@ -8,74 +8,47 @@ const MOVE_DURATION_SECONDS: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Expression {
-    Blink,
-    Squint,
-    WinkLeft,
-    WinkRight,
     Surprise,
     LookUp,
     LookDown,
-    Sad,
     Angry,
-    Sleepy,
     Curious,
 }
 
 impl Expression {
-    pub(crate) const ALL: [Self; 11] = [
-        Self::Blink,
-        Self::Squint,
-        Self::WinkLeft,
-        Self::WinkRight,
+    pub(crate) const ALL: [Self; 5] = [
         Self::Surprise,
         Self::LookUp,
         Self::LookDown,
-        Self::Sad,
         Self::Angry,
-        Self::Sleepy,
         Self::Curious,
     ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Blink => "Blink",
-            Self::Squint => "Squint",
-            Self::WinkLeft => "Left wink",
-            Self::WinkRight => "Right wink",
             Self::Surprise => "Surprised",
             Self::LookUp => "Look up",
             Self::LookDown => "Look down",
-            Self::Sad => "Sad",
             Self::Angry => "Angry",
-            Self::Sleepy => "Sleepy",
             Self::Curious => "Curious",
         }
     }
 
     pub(crate) fn compact(self) -> &'static str {
         match self {
-            Self::Blink | Self::Sleepy => "-_-",
-            Self::Squint => "=_=",
-            Self::WinkLeft => "-_o",
-            Self::WinkRight => "o_-",
             Self::Surprise => "O_O",
-            Self::LookUp => "^_^",
-            Self::LookDown | Self::Sad => "u_u",
-            Self::Angry => ">_<",
+            Self::LookUp => "o^o",
+            Self::LookDown => "ovo",
+            Self::Angry => "o!o",
             Self::Curious => "o_O",
         }
     }
 
     fn duration(self) -> f64 {
         match self {
-            Self::Blink => 0.24,
-            Self::Squint => 0.9,
-            Self::WinkLeft | Self::WinkRight => 0.4,
             Self::Surprise => 1.2,
             Self::LookUp | Self::LookDown => 0.9,
-            Self::Sad => 1.6,
             Self::Angry => 1.3,
-            Self::Sleepy => 2.2,
             Self::Curious => 1.5,
         }
     }
@@ -84,21 +57,9 @@ impl Expression {
         // 平滑进入、短暂停留、平滑退出，避免长表情始终处于变形途中。
         let edge = (progress * 5.0).min((1.0 - progress) * 5.0).clamp(0.0, 1.0);
         let pulse = edge * edge * (3.0 - 2.0 * edge);
-        let close = 1.0 - (progress * PI).sin().powi(2);
         let mut pose = FacePose::default();
 
         match self {
-            Self::Blink => {
-                pose.eyes[0].scale_y = close;
-                pose.eyes[1].scale_y = close;
-            }
-            Self::Squint => {
-                for eye in &mut pose.eyes {
-                    eye.scale_y = 1.0 - pulse * 0.55;
-                }
-            }
-            Self::WinkLeft => pose.eyes[0].scale_y = close,
-            Self::WinkRight => pose.eyes[1].scale_y = close,
             Self::Surprise => {
                 for eye in &mut pose.eyes {
                     eye.scale_x = 1.0 + pulse * 0.08;
@@ -111,15 +72,9 @@ impl Expression {
                     eye.offset_y = direction * pulse * 0.35;
                 }
             }
-            Self::Sad => {
-                for eye in &mut pose.eyes {
-                    eye.shape = EyeShape::Sad;
-                    eye.blend = pulse;
-                }
-            }
             Self::Angry => {
                 for (index, eye) in pose.eyes.iter_mut().enumerate() {
-                    eye.scale_y = 1.0 - pulse * 0.35;
+                    eye.scale_y = 1.0 - pulse * 0.15;
                     eye.tilt = if index == 0 {
                         pulse * 0.45
                     } else {
@@ -127,28 +82,15 @@ impl Expression {
                     };
                 }
             }
-            Self::Sleepy => {
-                for eye in &mut pose.eyes {
-                    eye.scale_y = 1.0 - pulse * 0.8;
-                    eye.offset_y = pulse * 0.2;
-                }
-            }
             Self::Curious => {
                 pose.eyes[0].scale_y = 1.0 + pulse * 0.25;
                 pose.eyes[0].offset_y = -pulse * 0.25;
-                pose.eyes[1].scale_y = 1.0 - pulse * 0.5;
+                pose.eyes[1].scale_y = 1.0 - pulse * 0.15;
                 pose.eyes[1].offset_y = pulse * 0.2;
             }
         }
         pose
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) enum EyeShape {
-    #[default]
-    Oval,
-    Sad,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -157,8 +99,6 @@ pub(crate) struct EyePose {
     pub(crate) scale_y: f64,
     pub(crate) offset_y: f64,
     pub(crate) tilt: f64,
-    pub(crate) shape: EyeShape,
-    pub(crate) blend: f64,
 }
 
 impl Default for EyePose {
@@ -168,8 +108,6 @@ impl Default for EyePose {
             scale_y: 1.0,
             offset_y: 0.0,
             tilt: 0.0,
-            shape: EyeShape::Oval,
-            blend: 0.0,
         }
     }
 }
@@ -234,17 +172,9 @@ impl AnimationState {
         });
         let kind = Expression::ALL[index];
         // 手动切换直接显示动作，暂停时也能预览每一种表情。
-        let progress = if matches!(
-            kind,
-            Expression::Blink | Expression::WinkLeft | Expression::WinkRight
-        ) {
-            0.5
-        } else {
-            0.25
-        };
         self.eye_action = Some(EyeAction {
             kind,
-            start: t - kind.duration() * progress,
+            start: t - kind.duration() * 0.25,
         });
         self.last_expression = Some(kind);
     }
@@ -286,8 +216,8 @@ impl AnimationState {
             return;
         }
 
-        // 排除上一动作，既保留自然眨眼的高频率，也避免连续重复。
-        const WEIGHTS: [u32; Expression::ALL.len()] = [20, 10, 7, 7, 7, 6, 6, 5, 5, 5, 6];
+        // 只调度睁眼动作，并排除上一动作，避免连续重复。
+        const WEIGHTS: [u32; Expression::ALL.len()] = [7, 6, 6, 5, 6];
         let total: u32 = Expression::ALL
             .iter()
             .zip(WEIGHTS)
@@ -372,18 +302,26 @@ mod tests {
                     assert!((eye.scale_y - 1.0).abs() < 1e-10, "{kind:?}");
                     assert!(eye.offset_y.abs() < 1e-10, "{kind:?}");
                     assert!(eye.tilt.abs() < 1e-10, "{kind:?}");
-                    assert!(eye.blend.abs() < 1e-10, "{kind:?}");
                 }
             }
         }
     }
 
     #[test]
-    fn blink_closes_both_eyes_and_wink_only_closes_one() {
-        assert_eq!(Expression::Blink.pose(0.5).eyes[0].scale_y, 0.0);
-        assert_eq!(Expression::Blink.pose(0.5).eyes[1].scale_y, 0.0);
-        assert_eq!(Expression::WinkLeft.pose(0.5).eyes[1].scale_y, 1.0);
-        assert_eq!(Expression::WinkRight.pose(0.5).eyes[0].scale_y, 1.0);
+    fn every_expression_keeps_both_eyes_open_throughout_the_action() {
+        for kind in Expression::ALL {
+            for step in 0..=100 {
+                for eye in kind.pose(f64::from(step) / 100.0).eyes {
+                    assert!(
+                        (0.85..=1.3).contains(&eye.scale_y),
+                        "{kind:?} at step {step}"
+                    );
+                }
+            }
+            // 小窗口的替代图案也不能退化为闭眼线条。
+            let compact = kind.compact();
+            assert!(compact.starts_with(['o', 'O']) && compact.ends_with(['o', 'O']));
+        }
     }
 
     #[test]
@@ -396,7 +334,7 @@ mod tests {
             assert_ne!(pose.eyes, FacePose::default().eyes);
         }
         animation.next_expression(0.0);
-        assert_eq!(animation.expression(), Some(Expression::Blink));
+        assert_eq!(animation.expression(), Some(Expression::Surprise));
     }
 
     #[test]
@@ -421,10 +359,10 @@ mod tests {
     fn finished_action_leaves_a_rest_period() {
         let mut animation = AnimationState::with_seed(1);
         animation.next_expression(1.0);
-        animation.sample(2.0);
+        animation.sample(3.0);
         assert_eq!(animation.expression(), None);
-        assert!((2.8..4.8).contains(&animation.next_eye_action_at));
-        animation.sample(2.5);
+        assert!((3.8..5.8).contains(&animation.next_eye_action_at));
+        animation.sample(3.5);
         assert_eq!(animation.expression(), None);
     }
 
@@ -458,7 +396,7 @@ mod tests {
             assert_eq!(animation.sample(t), pose);
             assert!(pose.gaze_x.abs() <= 1.0);
             for eye in pose.eyes {
-                assert!((0.0..=1.3).contains(&eye.scale_y));
+                assert!((0.85..=1.3).contains(&eye.scale_y));
                 assert!(eye.offset_y.abs() <= 0.35);
             }
         }
