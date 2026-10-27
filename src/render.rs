@@ -7,20 +7,28 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 
-use crate::animation::{Expression, EyePose, FacePose};
+use crate::animation::{EyePose, FacePose, Point};
+
+const MAX_CELLS: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum RenderMode {
+pub(crate) enum Mode {
     #[default]
-    Braille,
+    Dots,
     Blocks,
 }
 
-impl RenderMode {
-    fn samples(self) -> &'static [(f64, f64, u8)] {
+impl Mode {
+    pub(crate) fn toggle(&mut self) {
+        *self = match self {
+            Self::Dots => Self::Blocks,
+            Self::Blocks => Self::Dots,
+        };
+    }
+
+    fn samples(self) -> &'static [(f32, f32, u8)] {
         match self {
-            // Unicode 盲文点位不是逐行连续编号，底行分别使用第 7、8 位。
-            Self::Braille => &[
+            Self::Dots => &[
                 (0.25, 0.125, 1),
                 (0.75, 0.125, 8),
                 (0.25, 0.375, 2),
@@ -44,223 +52,172 @@ impl RenderMode {
             return ' ';
         }
         match self {
-            // u8 掩码限定在 U+2800..=U+28FF 内，必然是合法 Unicode 标量。
-            Self::Braille => char::from_u32(0x2800 + u32::from(mask))
-                .expect("all eight-dot braille masks are valid Unicode"),
-            Self::Blocks => quadrant_char(mask),
-        }
-    }
-
-    fn hints(self) -> &'static str {
-        match self {
-            Self::Braille => "  Space:next P:pause B:blocks Q:quit",
-            Self::Blocks => "  Space:next P:pause B:dots Q:quit",
+            // u8 掩码使码点限定在 U+2800..=U+28FF，必然是合法 Unicode 标量。
+            Self::Dots => char::from_u32(0x2800 + u32::from(mask))
+                .expect("all eight-dot masks are valid Unicode"),
+            Self::Blocks => [
+                ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+            ][usize::from(mask)],
         }
     }
 }
 
-pub(crate) struct Scene<'a> {
-    pub(crate) pose: FacePose,
-    pub(crate) expression: Option<Expression>,
-    pub(crate) paused: bool,
-    pub(crate) time: &'a str,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Style {
+    pub(crate) mode: Mode,
+    pub(crate) monochrome: bool,
 }
 
-#[derive(Debug)]
-struct Layout {
-    content_height: u16,
-    footer_y: Option<u16>,
-    eyes: Option<[EyeGeometry; 2]>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct EyeGeometry {
-    center_x: f64,
-    center_y: f64,
-    radius_x: f64,
-    radius_y: f64,
+/// 字符格通常高约为宽的两倍；在物理比例一致的世界坐标中布局与命中测试。
+#[derive(Clone, Copy)]
+pub(crate) struct Layout {
+    center: Point,
+    unit: f32,
 }
 
 impl Layout {
-    fn new(width: u16, height: u16) -> Self {
-        let footer_y = (width >= 5 && height >= 3).then(|| height - 1);
-        let content_height = height - u16::from(footer_y.is_some());
-        let eyes = if width >= 12 && content_height >= 4 {
-            let w = f64::from(width);
-            let h = f64::from(content_height);
-            // 为最大表情、上下移动及底栏留出空间，宽而矮的终端也不会裁掉眼睛。
-            let radius = (w / 12.0).min(h / 4.0);
-            let margin = radius * 1.6;
-            let center_y = (h * 0.4).clamp(margin, h - margin);
-            Some([
-                EyeGeometry {
-                    center_x: w / 2.0 - radius * 2.0,
-                    center_y,
-                    radius_x: radius,
-                    radius_y: radius,
-                },
-                EyeGeometry {
-                    center_x: w / 2.0 + radius * 2.0,
-                    center_y,
-                    radius_x: radius,
-                    radius_y: radius,
-                },
-            ])
-        } else {
-            None
-        };
+    pub(crate) fn new(size: (u16, u16)) -> Self {
         Self {
-            content_height,
-            footer_y,
-            eyes,
+            center: Point::new(f32::from(size.0) * 0.5, f32::from(size.1) * 0.5),
+            unit: (f32::from(size.0) / 2.2)
+                .min(f32::from(size.1) * 2.0 / 1.45)
+                .max(0.001),
         }
+    }
+
+    pub(crate) fn pointer(self, column: u16, row: u16) -> Point {
+        Point::new(
+            (f32::from(column) + 0.5 - self.center.x) / self.unit,
+            (f32::from(row) + 0.5 - self.center.y) * 2.0 / self.unit,
+        )
     }
 }
 
 #[derive(Default)]
 struct Frame {
-    width: u16,
-    height: u16,
+    size: (u16, u16),
     cells: Vec<char>,
 }
 
 impl Frame {
-    fn resize(&mut self, width: u16, height: u16) {
-        self.width = width;
-        self.height = height;
-        self.cells
-            .resize(usize::from(width) * usize::from(height), ' ');
+    fn clear(&mut self, size: (u16, u16)) -> io::Result<()> {
+        let count = usize::from(size.0) * usize::from(size.1);
+        if count > MAX_CELLS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "终端尺寸超过安全绘制范围",
+            ));
+        }
+        if count > self.cells.len() {
+            self.cells
+                .try_reserve(count - self.cells.len())
+                .map_err(io::Error::other)?;
+        }
+        self.cells.resize(count, ' ');
         self.cells.fill(' ');
+        self.size = size;
+        Ok(())
     }
 
-    fn put(&mut self, x: u16, y: u16, value: char) {
-        if x < self.width && y < self.height {
-            self.cells[usize::from(y) * usize::from(self.width) + usize::from(x)] = value;
-        }
-    }
-
-    // 所有底栏和紧凑表情都使用单列 ASCII，避免窄终端的中英文宽度歧义。
-    fn text(&mut self, x: u16, y: u16, text: &str, max_width: u16) {
-        let available = self.width.saturating_sub(x).min(max_width);
-        for (offset, ch) in text.chars().take(usize::from(available)).enumerate() {
-            self.put(x + offset as u16, y, ch);
-        }
-    }
-
-    fn compose(&mut self, scene: &Scene<'_>, mode: RenderMode) {
-        let layout = Layout::new(self.width, self.height);
-        if self.width == 0 || self.height == 0 {
+    fn compose(&mut self, pose: FacePose, mode: Mode) {
+        let (width, height) = self.size;
+        if width == 0 || height == 0 {
             return;
         }
-        if let Some(eyes) = layout.eyes {
-            for (geometry, pose) in eyes.into_iter().zip(scene.pose.eyes) {
-                self.draw_eye(geometry, pose, scene.pose.gaze_x, &layout, mode);
+        if width < 12 || height < 4 {
+            // 极小窗口也只显示眼睛，不添加嘴、状态栏或提示文字。
+            let text = if width >= 3 {
+                "o o"
+            } else if width == 2 {
+                "oo"
+            } else {
+                "o"
+            };
+            let start = usize::from(height / 2) * usize::from(width)
+                + (usize::from(width) - text.len()) / 2;
+            for (offset, ch) in text.chars().enumerate() {
+                self.cells[start + offset] = ch;
             }
-        } else if layout.content_height > 0 {
-            let compact = scene.expression.map_or("o_o", Expression::compact);
-            let text_width = (compact.len() as u16).min(self.width);
-            self.text(
-                (self.width - text_width) / 2,
-                layout.content_height / 2,
-                compact,
-                text_width,
-            );
+            return;
         }
-        if let Some(y) = layout.footer_y {
-            let time_width = scene.time.len().min(usize::from(u16::MAX)) as u16;
-            if time_width <= self.width {
-                self.text(self.width - time_width, y, scene.time, time_width);
-                let available = self.width.saturating_sub(time_width).saturating_sub(1);
-                let label = scene.expression.map_or("Idle", Expression::label);
-                self.text(0, y, label, available);
-                let mut x = label.len() as u16;
-                if scene.paused {
-                    self.text(x, y, " [paused]", available.saturating_sub(x));
-                    x += 9;
-                }
-                if self.width >= 64 {
-                    self.text(x, y, mode.hints(), available.saturating_sub(x));
-                }
-            }
+        let layout = Layout::new(self.size);
+        for eye in pose.eyes {
+            self.eye(eye, layout, mode);
         }
     }
 
-    fn draw_eye(
-        &mut self,
-        geometry: EyeGeometry,
-        pose: EyePose,
-        gaze_x: f64,
-        layout: &Layout,
-        mode: RenderMode,
-    ) {
-        let center_x = geometry.center_x + gaze_x * geometry.radius_x * 0.4;
-        let center_y = geometry.center_y + pose.offset_y * geometry.radius_y;
-        let radius_x = geometry.radius_x * pose.scale_x;
-        // 使用浮点半径保留亚字符精度，极小窗口下也保证采样厚度。
-        let radius_y = (geometry.radius_y * pose.scale_y).max(0.3);
-        let extent_y = radius_y * (1.0 + pose.tilt.abs());
-        let min_x = (center_x - radius_x).floor().max(0.0) as u16;
-        let max_x = (center_x + radius_x).ceil().min(f64::from(self.width)) as u16;
-        let min_y = (center_y - extent_y).floor().max(0.0) as u16;
-        let max_y = (center_y + extent_y)
-            .ceil()
-            .min(f64::from(layout.content_height)) as u16;
-        let inv_radius_x = radius_x.recip();
-        let inv_radius_y = radius_y.recip();
+    fn eye(&mut self, eye: EyePose, layout: Layout, mode: Mode) {
+        let center = layout.center
+            + Point::new(eye.center.x * layout.unit, eye.center.y * layout.unit * 0.5);
+        let radius = Point::new(eye.radius.x * layout.unit, eye.radius.y * layout.unit * 0.5);
+        let extent_y = radius.y * (1.0 + eye.tilt.abs());
+        let min_x = (center.x - radius.x).floor().max(0.0) as u16;
+        let max_x = (center.x + radius.x).ceil().min(f32::from(self.size.0)) as u16;
+        let min_y = (center.y - extent_y).floor().max(0.0) as u16;
+        let max_y = (center.y + extent_y).ceil().min(f32::from(self.size.1)) as u16;
+        let inverse = Point::new(radius.x.recip(), radius.y.recip());
         let samples = mode.samples();
         let mut offsets = [(0.0, 0.0, 0); 8];
-        // 每只眼睛只换算一次采样偏移，像素内循环不再重复做浮点除法。
-        for (offset, &(x, y, bit)) in offsets.iter_mut().zip(samples) {
-            let dx = x * inv_radius_x;
-            *offset = (dx, y * inv_radius_y - pose.tilt * dx, bit);
+        for (output, &(x, y, bit)) in offsets.iter_mut().zip(samples) {
+            let dx = x * inverse.x;
+            *output = (dx, y * inverse.y - eye.tilt * dx, bit);
         }
         for y in min_y..max_y {
             for x in min_x..max_x {
-                let dx = (f64::from(x) - center_x) * inv_radius_x;
-                let dy = (f64::from(y) - center_y) * inv_radius_y - pose.tilt * dx;
+                let dx = (f32::from(x) - center.x) * inverse.x;
+                let dy = (f32::from(y) - center.y) * inverse.y - eye.tilt * dx;
                 let mut mask = 0;
-                for &(offset_x, offset_y, bit) in &offsets[..samples.len()] {
-                    if eye_contains(dx + offset_x, dy + offset_y) {
+                for &(ox, oy, bit) in &offsets[..samples.len()] {
+                    if contains(dx + ox, dy + oy, eye) {
                         mask |= bit;
                     }
                 }
                 if mask != 0 {
-                    self.put(x, y, mode.character(mask));
+                    self.cells[usize::from(y) * usize::from(self.size.0) + usize::from(x)] =
+                        mode.character(mask);
                 }
             }
         }
     }
 }
 
-fn eye_contains(x: f64, y: f64) -> bool {
-    x * x + y * y <= 1.0
+fn contains(x: f32, y: f32, eye: EyePose) -> bool {
+    let squared = x * x + y * y;
+    let rounded = squared + eye.roundness * (x.powi(4) + y.powi(4) - squared);
+    rounded <= 1.0 && y >= -1.0 + eye.upper_lid + eye.lid_tilt * x
 }
 
-fn quadrant_char(mask: u8) -> char {
-    const QUADRANTS: [char; 16] = [
-        ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
-    ];
-    QUADRANTS[usize::from(mask)]
+fn foreground(pose: FacePose, monochrome: bool) -> Color {
+    if monochrome {
+        return Color::White;
+    }
+    let cool = [220.0, 237.0, 243.0];
+    let warm = [255.0, 237.0, 210.0];
+    let color: [u8; 3] = std::array::from_fn(|index| {
+        let value = (cool[index] + (warm[index] - cool[index]) * pose.warmth.clamp(0.0, 1.0))
+            * pose.brightness.clamp(0.0, 1.0);
+        // 量化很小的冷暖变化，避免静止时因一位色差不断重写所有点阵。
+        ((value.round() as u8) / 4) * 4
+    });
+    Color::Rgb {
+        r: color[0],
+        g: color[1],
+        b: color[2],
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct Renderer {
     previous: Frame,
     current: Frame,
-    run: String,
+    previous_color: Option<Color>,
+    previous_pose: Option<(FacePose, Style)>,
     output: Vec<u8>,
-    mode: RenderMode,
+    run: String,
     invalidated: bool,
 }
 
 impl Renderer {
-    pub(crate) fn toggle_mode(&mut self) {
-        self.mode = match self.mode {
-            RenderMode::Braille => RenderMode::Blocks,
-            RenderMode::Blocks => RenderMode::Braille,
-        };
-    }
-
     pub(crate) fn invalidate(&mut self) {
         self.invalidated = true;
     }
@@ -269,74 +226,81 @@ impl Renderer {
         &mut self,
         out: &mut impl Write,
         size: (u16, u16),
-        scene: &Scene<'_>,
+        pose: FacePose,
+        style: Style,
     ) -> io::Result<()> {
-        let (width, height) = size;
-        self.current.resize(width, height);
-        self.current.compose(scene, self.mode);
-        let resized = self.previous.width != width || self.previous.height != height;
-        if width == 0 || height == 0 {
-            self.previous.resize(width, height);
+        if !self.invalidated
+            && self.previous.size == size
+            && self.previous_pose == Some((pose, style))
+        {
+            return Ok(());
+        }
+        self.current.clear(size)?;
+        self.current.compose(pose, style.mode);
+        if size.0 == 0 || size.1 == 0 {
+            self.previous.clear(size)?;
             self.invalidate();
             return Ok(());
         }
+        let full_redraw = self.invalidated || self.previous.size != size;
+        let color = foreground(pose, style.monochrome);
+        let recolor = self.previous_color != Some(color);
         self.output.clear();
-        let full_redraw = resized || self.invalidated;
         let mut changed = full_redraw;
         if full_redraw {
             queue!(
                 self.output,
                 ResetColor,
                 Clear(ClearType::All),
-                SetForegroundColor(Color::White)
+                SetForegroundColor(color)
             )?;
         }
-        // 空格也参与差量绘制；合并至多两个未变字符的短间隔，减少光标控制序列。
-        for y in 0..height {
-            let row = usize::from(y) * usize::from(width);
+        for y in 0..size.1 {
+            let row = usize::from(y) * usize::from(size.0);
             let differs = |x: u16| {
                 let index = row + usize::from(x);
-                let old = if full_redraw {
+                let current = self.current.cells[index];
+                let previous = if full_redraw {
                     ' '
                 } else {
                     self.previous.cells[index]
                 };
-                self.current.cells[index] != old
+                current != previous || (recolor && current != ' ')
             };
             let mut x = 0;
-            while x < width {
+            while x < size.0 {
                 if !differs(x) {
                     x += 1;
                     continue;
                 }
                 if !changed {
                     changed = true;
-                    queue!(self.output, SetForegroundColor(Color::White))?;
+                    queue!(self.output, SetForegroundColor(color))?;
                 }
-                let start_x = x;
-                let mut end_x = x + 1;
-                let mut scan_x = end_x;
-                while scan_x < width && scan_x - end_x <= 2 {
-                    if differs(scan_x) {
-                        end_x = scan_x + 1;
+                let start = x;
+                let mut end = x + 1;
+                let mut scan = end;
+                while scan < size.0 && scan - end <= 2 {
+                    if differs(scan) {
+                        end = scan + 1;
                     }
-                    scan_x += 1;
+                    scan += 1;
                 }
                 self.run.clear();
-                self.run.extend(
-                    &self.current.cells[row + usize::from(start_x)..row + usize::from(end_x)],
-                );
-                queue!(self.output, MoveTo(start_x, y), Print(self.run.as_str()))?;
-                x = end_x;
+                self.run
+                    .extend(&self.current.cells[row + usize::from(start)..row + usize::from(end)]);
+                queue!(self.output, MoveTo(start, y), Print(self.run.as_str()))?;
+                x = end;
             }
         }
         if changed {
             queue!(self.output, ResetColor)?;
-            // 整帧先编码进可复用缓冲，再一次性提交，避免逐条指令触发终端 IO。
             out.write_all(&self.output)?;
             out.flush()?;
         }
         std::mem::swap(&mut self.previous, &mut self.current);
+        self.previous_color = Some(color);
+        self.previous_pose = Some((pose, style));
         self.invalidated = false;
         Ok(())
     }
@@ -345,438 +309,121 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::animation::AnimationState;
+    use crate::animation::{Companion, Input};
 
-    fn scene() -> Scene<'static> {
-        Scene {
-            pose: FacePose::default(),
-            expression: None,
-            paused: false,
-            time: "12:34",
-        }
-    }
-
-    fn frame(size: (u16, u16), scene: &Scene<'_>) -> Frame {
-        frame_with_mode(size, scene, RenderMode::default())
-    }
-
-    fn frame_with_mode(size: (u16, u16), scene: &Scene<'_>, mode: RenderMode) -> Frame {
+    fn frame(size: (u16, u16), pose: FacePose, mode: Mode) -> Frame {
         let mut frame = Frame::default();
-        frame.resize(size.0, size.1);
-        frame.compose(scene, mode);
+        frame.clear(size).unwrap();
+        frame.compose(pose, mode);
         frame
     }
 
-    #[derive(Default)]
-    struct OutputStats {
-        writes: usize,
-        flushes: usize,
-        bytes: usize,
-    }
-
-    impl Write for OutputStats {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.writes += 1;
-            self.bytes += bytes.len();
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.flushes += 1;
-            Ok(())
-        }
+    #[test]
+    fn ordinary_frames_contain_only_eyes_and_no_status_text_or_shading() {
+        let cells = frame((80, 24), FacePose::default(), Mode::Dots).cells;
+        assert!(
+            cells
+                .iter()
+                .all(|&ch| ch == ' ' || ('\u{2801}'..='\u{28ff}').contains(&ch))
+        );
+        assert!(cells.contains(&'⣿'));
+        assert!(cells[..80 * 3].iter().all(|&ch| ch == ' '));
+        assert!(cells[80 * 21..].iter().all(|&ch| ch == ' '));
+        assert_eq!(cells[12 * 80 + 40], ' ');
     }
 
     #[test]
-    fn layout_keeps_all_poses_inside_the_content_area() {
-        for (width, height) in [
-            (12, 5),
+    fn tiny_empty_and_repeatedly_resized_terminals_are_safe() {
+        let mut renderer = Renderer::default();
+        for size in [
             (80, 24),
             (240, 8),
             (20, 80),
-            (400, 120),
-            (u16::MAX, 5),
+            (12, 4),
+            (3, 2),
+            (1, 1),
+            (0, 0),
+            (80, 24),
         ] {
-            let layout = Layout::new(width, height);
-            let eyes = layout.eyes.expect("large enough for full eyes");
-            let mut animation = AnimationState::new();
-            for _ in Expression::ALL {
-                animation.next_expression(0.0);
-                let face = animation.sample(0.0);
-                for (geometry, pose) in eyes.into_iter().zip(face.eyes) {
-                    let center_y = geometry.center_y + pose.offset_y * geometry.radius_y;
-                    let extent =
-                        (geometry.radius_y * pose.scale_y).max(0.3) * (1.0 + pose.tilt.abs());
-                    assert!(center_y - extent >= 0.0, "{width}x{height}");
-                    assert!(
-                        center_y + extent <= f64::from(layout.content_height),
-                        "{width}x{height}"
-                    );
-                    for gaze in [-1.0, 1.0] {
-                        let x = geometry.center_x + gaze * geometry.radius_x * 0.4;
-                        assert!(x - geometry.radius_x * pose.scale_x >= 0.0);
-                        assert!(x + geometry.radius_x * pose.scale_x <= f64::from(width));
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn wide_short_windows_scale_the_entire_face_without_flattening_eyes() {
-        for (width, height) in [(240, 8), (400, 5), (80, 24)] {
-            let eyes = Layout::new(width, height).eyes.unwrap();
-            for eye in eyes {
-                assert_eq!(eye.radius_x, eye.radius_y);
-            }
-            assert!((eyes[0].center_x + eyes[1].center_x - f64::from(width)).abs() < 1e-10);
-            assert!((eyes[1].center_x - eyes[0].center_x - eyes[0].radius_x * 4.0).abs() < 1e-10);
-        }
-    }
-
-    #[test]
-    fn tiny_and_empty_terminals_are_safe() {
-        for width in 0..16 {
-            for height in 0..8 {
-                let frame = frame((width, height), &scene());
-                assert_eq!(frame.cells.len(), usize::from(width) * usize::from(height));
-                if width > 0 && height > 0 {
-                    assert!(frame.cells.iter().any(|&ch| ch != ' '));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn narrow_clock_is_hidden_and_full_clock_stays_on_the_last_row() {
-        let narrow = frame((4, 3), &scene());
-        assert!(!narrow.cells.contains(&':'));
-        for size in [(5, 3), (12, 5), (80, 24), (240, 8)] {
-            let frame = frame(size, &scene());
-            let clock: String = frame.cells[frame.cells.len() - 5..].iter().collect();
-            assert_eq!(clock, "12:34");
-        }
-    }
-
-    #[test]
-    fn shapes_have_distinct_silhouettes() {
-        let mut animation = AnimationState::new();
-        let mut silhouettes = Vec::new();
-        for _ in Expression::ALL {
-            animation.next_expression(0.0);
-            let mut scene = scene();
-            scene.pose = animation.sample(0.0);
-            let frame = frame((120, 40), &scene);
-            if !silhouettes.contains(&frame.cells) {
-                silhouettes.push(frame.cells);
-            }
-        }
-        assert_eq!(silhouettes.len(), Expression::ALL.len());
-    }
-
-    #[test]
-    fn open_eyes_are_filled_ellipses_instead_of_closed_curves() {
-        assert!(eye_contains(0.0, 0.0));
-        assert!(eye_contains(0.0, -0.8));
-        assert!(eye_contains(0.0, 0.8));
-        assert!(eye_contains(0.8, 0.0));
-        assert!(eye_contains(-0.8, 0.0));
-        assert!(!eye_contains(0.8, 0.8));
-        assert!(!eye_contains(1.1, 0.0));
-    }
-
-    #[test]
-    fn default_mode_uses_only_braille_dots_for_every_expression() {
-        assert_eq!(RenderMode::default(), RenderMode::Braille);
-        let mut animation = AnimationState::new();
-        for _ in Expression::ALL {
-            animation.next_expression(0.0);
-            let scene = Scene {
-                pose: animation.sample(0.0),
-                ..scene()
-            };
-            let frame = frame((80, 24), &scene);
-            let body = &frame.cells[..80 * 23];
-            assert!(body.contains(&'⣿'));
-            assert!(
-                body.iter()
-                    .all(|ch| *ch == ' ' || ('\u{2801}'..='\u{28ff}').contains(ch))
-            );
-        }
-    }
-
-    #[test]
-    fn braille_uses_the_standard_eight_dot_positions() {
-        let samples = RenderMode::Braille.samples();
-        assert_eq!(samples.len(), 8);
-        for (index, &(x, y, bit)) in samples.iter().enumerate() {
-            assert_eq!(x, if index % 2 == 0 { 0.25 } else { 0.75 });
-            assert_eq!(y, 0.125 + (index / 2) as f64 * 0.25);
-            assert_eq!(bit, [1, 8, 2, 16, 4, 32, 64, 128][index]);
-        }
-        for mask in 1..=u8::MAX {
+            let mut output = Vec::new();
+            renderer
+                .draw(&mut output, size, FacePose::default(), Style::default())
+                .unwrap();
             assert_eq!(
-                RenderMode::Braille.character(mask) as u32,
-                0x2800 + u32::from(mask)
+                renderer.previous.cells.len(),
+                usize::from(size.0) * usize::from(size.1)
             );
-        }
-        assert_eq!(RenderMode::Braille.character(0), ' ');
-        assert_eq!(RenderMode::Braille.character(255), '⣿');
-        assert_eq!(RenderMode::Blocks.character(15), '█');
-    }
-
-    #[test]
-    fn braille_resolves_vertical_motion_between_block_samples() {
-        let sample_cell = |mode, center_y| {
-            let mut frame = Frame::default();
-            frame.resize(12, 6);
-            let layout = Layout::new(12, 6);
-            frame.draw_eye(
-                EyeGeometry {
-                    center_x: 4.5,
-                    center_y,
-                    radius_x: 1.0,
-                    radius_y: 1.0,
-                },
-                EyePose {
-                    scale_y: 0.1,
-                    ..EyePose::default()
-                },
-                0.0,
-                &layout,
-                mode,
-            );
-            frame.cells[2 * 12 + 4]
-        };
-        assert_eq!(
-            sample_cell(RenderMode::Blocks, 2.0),
-            sample_cell(RenderMode::Blocks, 2.125)
-        );
-        assert_ne!(
-            sample_cell(RenderMode::Braille, 2.0),
-            sample_cell(RenderMode::Braille, 2.125)
-        );
-    }
-
-    #[test]
-    fn mode_switch_replaces_old_glyphs_without_clearing_the_screen() {
-        let mut renderer = Renderer::default();
-        let mut output = Vec::new();
-        for (index, mode) in [RenderMode::Braille, RenderMode::Blocks, RenderMode::Braille]
-            .into_iter()
-            .enumerate()
-        {
-            output.clear();
-            renderer.draw(&mut output, (80, 24), &scene()).unwrap();
-            assert_eq!(renderer.mode, mode);
-            assert_eq!(
-                renderer.previous.cells,
-                frame_with_mode((80, 24), &scene(), mode).cells
-            );
-            if index > 0 {
-                assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
-            }
-            if mode == RenderMode::Blocks {
-                assert!(
-                    !renderer
-                        .previous
-                        .cells
-                        .iter()
-                        .any(|ch| ('\u{2800}'..='\u{28ff}').contains(ch))
-                );
-            }
-            renderer.toggle_mode();
-        }
-    }
-
-    #[test]
-    fn changed_frames_are_submitted_with_one_write_and_one_flush() {
-        let mut renderer = Renderer::default();
-        let mut stats = OutputStats::default();
-        renderer.draw(&mut stats, (160, 48), &scene()).unwrap();
-        assert_eq!((stats.writes, stats.flushes), (1, 1));
-        renderer.draw(&mut stats, (160, 48), &scene()).unwrap();
-        assert_eq!((stats.writes, stats.flushes), (1, 1));
-        renderer
-            .draw(
-                &mut stats,
-                (160, 48),
-                &Scene {
-                    time: "12:35",
-                    ..scene()
-                },
-            )
-            .unwrap();
-        assert_eq!((stats.writes, stats.flushes), (2, 2));
-    }
-
-    #[test]
-    fn nearby_changes_share_one_cursor_move() {
-        let mut renderer = Renderer::default();
-        let mut output = Vec::new();
-        renderer.draw(&mut output, (80, 24), &scene()).unwrap();
-        output.clear();
-        renderer
-            .draw(
-                &mut output,
-                (80, 24),
-                &Scene {
-                    time: "13:35",
-                    ..scene()
-                },
-            )
-            .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("\x1b[24;77H3:35"));
-        assert_eq!(output.matches('H').count(), 1);
-    }
-
-    #[test]
-    fn unchanged_frame_produces_no_terminal_output() {
-        let mut renderer = Renderer::default();
-        let mut output = Vec::new();
-        renderer.draw(&mut output, (80, 24), &scene()).unwrap();
-        assert!(output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
-        output.clear();
-        renderer.draw(&mut output, (80, 24), &scene()).unwrap();
-        assert!(output.is_empty());
-    }
-
-    #[test]
-    fn clock_update_only_writes_the_changed_character() {
-        let mut renderer = Renderer::default();
-        let mut output = Vec::new();
-        renderer.draw(&mut output, (80, 24), &scene()).unwrap();
-        output.clear();
-        renderer
-            .draw(
-                &mut output,
-                (80, 24),
-                &Scene {
-                    time: "12:35",
-                    ..scene()
-                },
-            )
-            .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("\x1b[24;80H5"));
-        assert!(!output.contains("\x1b[2J"));
-        assert!(!output.contains('█'));
-    }
-
-    #[test]
-    fn shrinking_growing_and_invalidating_force_a_clean_redraw() {
-        let mut renderer = Renderer::default();
-        let mut output = Vec::new();
-        for size in [(120, 40), (20, 6), (1, 1), (0, 0), (80, 24), (240, 8)] {
-            output.clear();
-            renderer.draw(&mut output, size, &scene()).unwrap();
             if size != (0, 0) {
                 assert!(output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
             }
-            assert_eq!(renderer.previous.cells, frame(size, &scene()).cells);
         }
-        output.clear();
-        renderer.invalidate();
-        renderer.draw(&mut output, (240, 8), &scene()).unwrap();
-        assert!(output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        assert!(Frame::default().clear((u16::MAX, u16::MAX)).is_err());
     }
 
     #[test]
-    fn motion_erases_old_pixels_without_clearing_the_screen() {
+    fn stationary_frames_produce_no_output_and_mode_changes_do_not_clear() {
         let mut renderer = Renderer::default();
         let mut output = Vec::new();
-        renderer.draw(&mut output, (80, 24), &scene()).unwrap();
+        renderer
+            .draw(&mut output, (80, 24), FacePose::default(), Style::default())
+            .unwrap();
         output.clear();
-        let moved = Scene {
-            pose: FacePose {
-                gaze_x: 1.0,
-                ..FacePose::default()
-            },
-            ..scene()
-        };
-        renderer.draw(&mut output, (80, 24), &moved).unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains(' '));
-        assert!(!output.contains("\x1b[2J"));
-        assert_eq!(renderer.previous.cells, frame((80, 24), &moved).cells);
-    }
-
-    #[test]
-    fn flush_errors_do_not_commit_an_unfinished_frame() {
-        struct FailedFlush;
-        impl Write for FailedFlush {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
-            }
-        }
-        let mut renderer = Renderer::default();
-        assert_eq!(
-            renderer
-                .draw(&mut FailedFlush, (80, 24), &scene())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::BrokenPipe
+        renderer
+            .draw(&mut output, (80, 24), FacePose::default(), Style::default())
+            .unwrap();
+        assert!(output.is_empty());
+        renderer
+            .draw(
+                &mut output,
+                (80, 24),
+                FacePose::default(),
+                Style {
+                    mode: Mode::Blocks,
+                    ..Style::default()
+                },
+            )
+            .unwrap();
+        assert!(!output.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        assert!(
+            !renderer
+                .previous
+                .cells
+                .iter()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(ch))
         );
-        assert!(renderer.previous.cells.is_empty());
-        renderer.draw(&mut io::sink(), (80, 24), &scene()).unwrap();
-        assert_eq!(renderer.previous.cells, frame((80, 24), &scene()).cells);
     }
 
     #[test]
-    #[ignore = "手动测量渲染耗时与输出量，不在正常测试中断言机器性能"]
-    fn measure_render_throughput() {
-        use std::time::{Duration, Instant};
-
-        for mode in [RenderMode::Blocks, RenderMode::Braille] {
-            for size in [(80, 24), (160, 48), (320, 100)] {
-                let mut renderer = Renderer {
-                    mode,
-                    ..Renderer::default()
-                };
-                let mut stats = OutputStats::default();
-                let mut animation = AnimationState::new();
-                let frame_count = Expression::ALL.len() * 120;
-                let mut timings = Vec::with_capacity(frame_count);
-                for index in 0..frame_count {
-                    let t = index as f64 / 60.0;
-                    if index % 60 == 0 {
-                        animation.next_expression(t);
-                    }
-                    let mut pose = animation.sample(t);
-                    pose.gaze_x = (t * 3.0).sin();
-                    let scene = Scene {
-                        pose,
-                        expression: animation.expression(),
-                        ..scene()
-                    };
-                    let start = Instant::now();
-                    renderer.draw(&mut stats, size, &scene).unwrap();
-                    timings.push(start.elapsed());
-                    std::hint::black_box(&renderer.previous.cells);
-                }
-                let total: Duration = timings.iter().sum();
-                timings.sort_unstable();
-                println!(
-                    "{mode:?} {}x{}: avg={:.1}us p95={:.1}us max={:.1}us bytes/frame={:.1}",
-                    size.0,
-                    size.1,
-                    total.as_secs_f64() * 1e6 / timings.len() as f64,
-                    timings[timings.len() * 95 / 100].as_secs_f64() * 1e6,
-                    timings.last().unwrap().as_secs_f64() * 1e6,
-                    stats.bytes as f64 / timings.len() as f64
-                );
-            }
+    fn input_mapping_uses_the_same_aspect_ratio_as_the_eyes() {
+        let size = (80, 24);
+        let layout = Layout::new(size);
+        let pointer = layout.pointer(39, 11);
+        assert!(pointer.x.abs() < 0.02 && pointer.y.abs() < 0.04);
+        for size in [(240, 8), (20, 80), (80, 24)] {
+            let layout = Layout::new(size);
+            let eye = FacePose::default().eyes[0];
+            assert!(
+                eye.center.x.abs() * layout.unit + eye.radius.x * layout.unit
+                    < f32::from(size.0) * 0.5
+            );
+            assert!(eye.radius.y * layout.unit * 0.5 < f32::from(size.1) * 0.5);
         }
     }
 
     #[test]
-    fn write_errors_are_propagated() {
-        struct BrokenWriter;
-        impl Write for BrokenWriter {
+    fn subtle_eyelids_keep_a_filled_open_center() {
+        let mut eye = FacePose::default().eyes[0];
+        eye.upper_lid = 0.25;
+        eye.lid_tilt = 0.3;
+        assert!(contains(0.0, 0.0, eye));
+        assert!(!contains(0.0, -0.9, eye));
+        assert!(contains(0.0, 0.8, eye));
+    }
+
+    #[test]
+    fn failed_output_does_not_commit_the_frame() {
+        struct Broken;
+        impl Write for Broken {
             fn write(&mut self, _: &[u8]) -> io::Result<usize> {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
             }
@@ -784,9 +431,80 @@ mod tests {
                 Ok(())
             }
         }
-        let error = Renderer::default()
-            .draw(&mut BrokenWriter, (80, 24), &scene())
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        let mut renderer = Renderer::default();
+        assert!(
+            renderer
+                .draw(&mut Broken, (80, 24), FacePose::default(), Style::default())
+                .is_err()
+        );
+        assert!(renderer.previous_pose.is_none());
+        renderer
+            .draw(
+                &mut io::sink(),
+                (80, 24),
+                FacePose::default(),
+                Style::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn braille_masks_are_exact_and_never_become_a_texture() {
+        for mask in 1..=255 {
+            assert_eq!(Mode::Dots.character(mask) as u32, 0x2800 + u32::from(mask));
+        }
+        assert_eq!(Mode::Dots.character(0), ' ');
+        assert_eq!(Mode::Blocks.character(15), '█');
+    }
+
+    #[test]
+    #[ignore = "手动测量，不把机器性能作为测试条件"]
+    fn measure_render_throughput() {
+        use std::time::{Duration, Instant};
+        for mode in [Mode::Dots, Mode::Blocks] {
+            for size in [(80, 24), (160, 48), (320, 100)] {
+                let mut model = Companion::default();
+                let mut renderer = Renderer::default();
+                let mut output = Vec::new();
+                let mut timings = Vec::new();
+                let mut bytes = 0;
+                for index in 0..600 {
+                    let t = index as f32 / 60.0;
+                    let pose = model.update(
+                        1.0 / 60.0,
+                        Input {
+                            pointer: Some(Point::new((t * 2.0).sin(), (t * 1.1).cos() * 0.4)),
+                            greet: index == 100,
+                            ..Input::default()
+                        },
+                    );
+                    output.clear();
+                    let start = Instant::now();
+                    renderer
+                        .draw(
+                            &mut output,
+                            size,
+                            pose,
+                            Style {
+                                mode,
+                                ..Style::default()
+                            },
+                        )
+                        .unwrap();
+                    timings.push(start.elapsed());
+                    bytes += output.len();
+                }
+                let total: Duration = timings.iter().sum();
+                timings.sort_unstable();
+                println!(
+                    "{mode:?} {}x{}: avg={:.2}ms p95={:.2}ms bytes/frame={:.0}",
+                    size.0,
+                    size.1,
+                    total.as_secs_f64() * 1000.0 / timings.len() as f64,
+                    timings[timings.len() * 95 / 100].as_secs_f64() * 1000.0,
+                    bytes as f64 / timings.len() as f64
+                );
+            }
+        }
     }
 }

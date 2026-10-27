@@ -2,9 +2,9 @@
 name = "animation_eyes"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.29.0"
 
 # 保留堆栈行号，避免日常构建生成大量调试信息。
